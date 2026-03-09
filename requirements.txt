@@ -1,0 +1,6 @@
+# Core dependencies (install from project root)
+# matplotlib is required for confusion matrix heatmap PNGs
+# pandas is required for confusion matrix tabulation
+matplotlib>=3.5.0
+numpy>=1.20.0
+pandas>=1.3.0

@@ -1,0 +1,58 @@
+experiment_id: sanitized_mbpp_execution_feedback_pilot
+experiment_name: Sanitized MBPP diagnosis with execution feedback pilot
+
+dataset:
+  path: sanitized-mbpp.json
+  format: sanitized_mbpp
+  max_problems: 100
+  run_filtering: true
+  filter_output_dir: data/filtered/sanitized_mbpp_direct_pilot
+  use_accepted_subset: true
+
+generation:
+  injector_types:
+    - condition_inversion
+    - wrong_comparison_operator
+  transformation_names: []
+  enable_transformations: false
+  include_original_sample: true
+  random_seed: 123
+  max_changed_lines: 3
+  require_reference_pass_all_tests: true
+  require_buggy_fail_some_tests: true
+  require_buggy_syntax_valid: true
+  require_buggy_executable: true
+  require_transformed_behavior_preserved: true
+
+prompt:
+  variant: diagnosis_with_execution_feedback
+  include_language_tag: true
+  include_output_schema_example: true
+  require_json_only_response: true
+
+models:
+  - provider_name: openai_compatible
+    model_name: gpt-5-mini
+    api_base_url: https://api.openai.com/v1
+    api_key_env_var: OPENAI_API_KEY
+    enable_json_output: true
+    temperature: 0.0
+    max_output_tokens: 4096
+    timeout_seconds: 60.0
+    max_retries: 3
+    backoff_initial_seconds: 1.0
+    backoff_multiplier: 2.0
+    extra_settings: {}
+
+evaluation:
+  localization_tolerance_lines: 0
+  repair_timeout_seconds: 3.0
+  use_hidden_tests_for_repair: true
+  use_public_tests_for_repair: true
+
+output:
+  results_dir: results/sanitized_mbpp_execution_feedback_pilot
+  jsonl_filename: results.jsonl
+  csv_filename: results.csv
+  artifact_root_dir: results/sanitized_mbpp_execution_feedback_pilot/artifacts
+  log_level: INFO
