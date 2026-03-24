@@ -1,0 +1,8 @@
+extends: sanitized_mbpp.common.yaml
+experiment_id: sanitized_mbpp_diagnosis_then_repair_pilot
+experiment_name: Sanitized MBPP diagnosis-then-repair pilot (two-stage)
+prompt:
+  variant: diagnosis_then_repair
+output:
+  results_dir: results/sanitized_mbpp_diagnosis_then_repair_pilot
+  artifact_root_dir: results/sanitized_mbpp_diagnosis_then_repair_pilot/artifacts

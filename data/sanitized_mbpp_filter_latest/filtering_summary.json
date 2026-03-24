@@ -1,0 +1,34 @@
+{
+  "acceptance_rate": 0.5081967213114754,
+  "accepted_count": 217,
+  "filter_config": {
+    "allow_classes": false,
+    "allow_file_io": false,
+    "evaluation_config": {
+      "localization_tolerance_lines": 0,
+      "max_mutants_for_adequacy": 8,
+      "min_mutants_killed": 1,
+      "repair_timeout_seconds": 3.0,
+      "use_hidden_tests_for_repair": true,
+      "use_mutation_adequacy": true,
+      "use_public_tests_for_repair": true
+    },
+    "execution_timeout_seconds": 2.0,
+    "max_reference_line_count": 30,
+    "max_top_level_function_count": 3,
+    "require_supported_injector_pattern": true
+  },
+  "input_path": "sanitized-mbpp.json",
+  "output_dir": "data\\sanitized_mbpp_filter_latest",
+  "rejected_count": 210,
+  "rejection_reason_counts": {
+    "No supported bug-injection pattern was detected.": 192,
+    "Reference solution could not be executed safely.": 8,
+    "Reference solution defines 4 top-level functions, exceeding the limit.": 1,
+    "Reference solution did not pass all executable tests.": 48,
+    "Reference solution imports disallowed modules.": 2,
+    "Reference solution imports modules outside the conservative allowlist.": 6,
+    "Tests could not be executed safely.": 8
+  },
+  "total_records": 427
+}

@@ -1,12 +1,12 @@
-"""Quality filters for injected and transformed samples."""
+"""Quality filters for injected buggy samples."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from thesis_exp.evaluators.diagnosis_evaluator import EvaluationConfig, execute_patched_code_safely
+from thesis_exp.evaluators.reference_validation import reference_passes_all_selected_tests
 from thesis_exp.schemas.sample import BuggyProgramSample
-from thesis_exp.transforms.base import TransformationResult
 
 
 @dataclass(slots=True)
@@ -18,7 +18,6 @@ class SampleQualityConfig:
     require_buggy_fail_some_tests: bool = True
     require_buggy_syntax_valid: bool = True
     require_buggy_executable: bool = True
-    require_transformed_behavior_preserved: bool = True
 
 
 @dataclass(slots=True)
@@ -34,19 +33,6 @@ class BuggySampleQualityReport:
     buggy_code_executable: bool
     buggy_fails_at_least_one_test: bool
     changed_lines_within_limit: bool
-    failure_reasons: list[str] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class TransformedSampleQualityReport:
-    """Validation report for one transformed sample."""
-
-    accepted: bool
-    transformed_sample_id: str
-    syntax_valid: bool
-    behavior_preserved: bool | None
-    bug_type_preserved: bool
-    supported_test_case_count: int
     failure_reasons: list[str] = field(default_factory=list)
 
 
@@ -69,12 +55,7 @@ def validate_buggy_sample(
         effective_evaluation_config,
     )
 
-    reference_passes_all_tests = (
-        reference_execution.syntax_valid
-        and not reference_execution.timed_out
-        and reference_execution.total_test_count > 0
-        and reference_execution.passed_test_count == reference_execution.total_test_count
-    )
+    reference_passes_all_tests = reference_passes_all_selected_tests(reference_execution)
     buggy_code_syntax_valid = buggy_execution.syntax_valid
     buggy_code_executable = (
         buggy_execution.syntax_valid
@@ -116,33 +97,5 @@ def validate_buggy_sample(
         buggy_code_executable=buggy_code_executable,
         buggy_fails_at_least_one_test=buggy_fails_at_least_one_test,
         changed_lines_within_limit=changed_lines_within_limit,
-        failure_reasons=failure_reasons,
-    )
-
-
-def validate_transformed_sample(
-    transformation_result: TransformationResult,
-    quality_config: SampleQualityConfig,
-) -> TransformedSampleQualityReport:
-    """Validate that a transformed sample preserves buggy behavior."""
-
-    validation_report = transformation_result.validation_report
-    behavior_preserved = validation_report.behavior_preserved
-    failure_reasons: list[str] = []
-
-    if not transformation_result.bug_type_preserved:
-        failure_reasons.append("Transformer did not guarantee bug-type preservation.")
-    if quality_config.require_transformed_behavior_preserved and behavior_preserved is not True:
-        failure_reasons.append("Transformed code did not preserve buggy behavior on supported tests.")
-    if not validation_report.syntax_valid:
-        failure_reasons.append("Transformed code is not syntactically valid.")
-
-    return TransformedSampleQualityReport(
-        accepted=not failure_reasons,
-        transformed_sample_id=transformation_result.transformed_sample.transformed_sample_id,
-        syntax_valid=validation_report.syntax_valid,
-        behavior_preserved=behavior_preserved,
-        bug_type_preserved=transformation_result.bug_type_preserved,
-        supported_test_case_count=validation_report.supported_test_case_count,
         failure_reasons=failure_reasons,
     )

@@ -176,31 +176,11 @@ class BuggyProgramSample(JsonSerializableDataclass):
 
 
 @dataclass(slots=True)
-class TransformedSample(JsonSerializableDataclass):
-    """Semantically transformed sample variant."""
-
-    transformed_sample_id: str
-    source_sample_id: str
-    problem_id: str
-    transformation_name: str
-    transformation_version: str
-    statement_transformed: bool
-    code_transformed: bool
-    transformed_problem_statement: str
-    transformed_starter_code: str
-    transformed_reference_code: str
-    transformed_buggy_code: str
-    transformation_notes: str = ""
-    random_seed: int | None = None
-
-
-@dataclass(slots=True)
 class ModelDiagnosisOutput(JsonSerializableDataclass):
     """Structured diagnosis output from a model."""
 
     diagnosis_output_id: str
     sample_id: str
-    transformed_sample_id: str | None
     model_provider_name: str
     model_name: str
     prompt_template_name: str
@@ -225,7 +205,6 @@ class EvaluationResult(JsonSerializableDataclass):
 
     evaluation_result_id: str
     sample_id: str
-    transformed_sample_id: str | None
     diagnosis_output_id: str
     ground_truth_bug_type: BugType
     predicted_bug_type: str | None
@@ -234,14 +213,22 @@ class EvaluationResult(JsonSerializableDataclass):
     predicted_bug_line_start: int | None = None
     predicted_bug_line_end: int | None = None
     bug_type_accuracy: float = 0.0
+    bug_type_accuracy_coarse: float = 0.0
     localization_accuracy: float = 0.0
     localization_accuracy_exact: float = 0.0
+    #: 1.0 iff patched code passes all selected (public/hidden per config) tests; independent of mutation adequacy.
+    patch_passes_selected_tests: float = 0.0
+    #: Strict repair: ``patch_passes_selected_tests`` plus mutation-adequacy gate when enabled (same as historical ``repair_success``).
     repair_success: float = 0.0
+    diagnosis_hallucination_rate: float = 0.0
+    narrative_hallucination_rate: float = 0.0
     hallucination_rate: float = 0.0
-    consistency_score: float = 0.0
+    narrative_hallucination_detected: bool = False
     hallucination_detected: bool = False
     repair_without_true_diagnosis: bool = False
     evaluation_notes: str = ""
+    #: Machine-readable mutation-adequacy outcome; see ``compute_repair_success`` docstring.
+    mutation_adequacy_status: str = ""
 
 
 @dataclass(slots=True)
@@ -257,7 +244,6 @@ class ExperimentConfig(JsonSerializableDataclass):
     prompt_template_name: str
     response_schema_name: str
     bug_types_to_inject: list[BugType]
-    transformation_names: list[str]
     max_samples_per_problem: int
     random_seed: int
     temperature: float = 0.0

@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import multiprocessing
 import warnings
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Suppress SyntaxWarning from MBPP reference/test code with invalid escape sequences
+warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
 from thesis_exp.datasets import (
     DatasetProtocolError,
@@ -19,21 +21,22 @@ from thesis_exp.datasets import (
     load_sanitized_mbpp_raw_payloads,
     validate_sanitized_mbpp_record,
 )
+from thesis_exp.evaluators.diagnosis_evaluator import EvaluationConfig, select_tests_for_evaluation
+from thesis_exp.evaluators.reference_validation import (
+    reference_execution_filter_fields,
+    validate_reference_solution,
+)
+from thesis_exp.execution.safe_exec import ALLOWED_IMPORT_ROOT_MODULES
+from thesis_exp.injectors.python import (
+    find_top_level_function,
+    function_has_accumulator_init_site,
+    function_has_condition_inversion_site,
+    function_has_off_by_one_site,
+    function_has_premature_return_site,
+    function_has_wrong_comparison_operator_site,
+    function_has_wrong_loop_bound_site,
+)
 from thesis_exp.schemas.sample import ProgrammingProblem, TestCase
-
-_ALLOWED_IMPORT_MODULES = {
-    "bisect",
-    "collections",
-    "functools",
-    "heapq",
-    "itertools",
-    "math",
-    "operator",
-    "re",
-    "statistics",
-    "string",
-    "typing",
-}
 
 _DISALLOWED_IMPORT_MODULES = {
     "os",
@@ -45,36 +48,6 @@ _DISALLOWED_IMPORT_MODULES = {
     "tempfile",
 }
 
-_SAFE_BUILTINS: dict[str, Any] = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "float": float,
-    "int": int,
-    "len": len,
-    "list": list,
-    "max": max,
-    "min": min,
-    "print": print,
-    "range": range,
-    "reversed": reversed,
-    "set": set,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "tuple": tuple,
-    "zip": zip,
-    "AssertionError": AssertionError,
-    "Exception": Exception,
-    "IndexError": IndexError,
-    "KeyError": KeyError,
-    "TypeError": TypeError,
-    "ValueError": ValueError,
-}
-
 
 @dataclass(slots=True)
 class SanitizedMbppFilterConfig:
@@ -83,9 +56,22 @@ class SanitizedMbppFilterConfig:
     max_reference_line_count: int = 30
     max_top_level_function_count: int = 3
     execution_timeout_seconds: float = 2.0
+    """Used only when ``evaluation_config`` is None (CLI default). Mirrors ``EvaluationConfig.repair_timeout_seconds``."""
+
+    evaluation_config: EvaluationConfig | None = None
+    """When set, reference test execution uses this (timeout, hidden/public tests) — same as batch experiments."""
+
     require_supported_injector_pattern: bool = True
     allow_classes: bool = False
     allow_file_io: bool = False
+
+
+def evaluation_config_for_sanitized_filter(config: SanitizedMbppFilterConfig) -> EvaluationConfig:
+    """Resolve the ``EvaluationConfig`` used for reference validation during filtering."""
+
+    if config.evaluation_config is not None:
+        return config.evaluation_config
+    return EvaluationConfig(repair_timeout_seconds=config.execution_timeout_seconds)
 
 
 @dataclass(slots=True)
@@ -136,112 +122,6 @@ class SanitizedMbppFilterArtifacts:
     filtering_summary_json: str
 
 
-def _safe_import(name: str, globals_: Any = None, locals_: Any = None, fromlist: Any = (), level: int = 0) -> Any:
-    """Restrict imports to a conservative standard-library allowlist."""
-
-    del globals_, locals_, fromlist, level
-    root_module = name.split(".")[0]
-    if root_module not in _ALLOWED_IMPORT_MODULES:
-        raise ImportError(f"Import of module '{root_module}' is not allowed in sanitized MBPP filtering.")
-    return __import__(name)
-
-
-def _select_supported_tests(test_cases: list[TestCase]) -> list[TestCase]:
-    return [
-        test_case
-        for test_case in test_cases
-        if test_case.test_case_type in {"unit_assertion", "custom"} and bool(test_case.test_code)
-    ]
-
-
-def _execution_worker(source_code: str, test_cases: list[TestCase], queue: multiprocessing.Queue) -> None:
-    """Execute reference code and tests in a subprocess."""
-
-    namespace: dict[str, Any] = {
-        "__builtins__": {
-            **_SAFE_BUILTINS,
-            "__import__": _safe_import,
-        },
-        "__name__": "__main__",
-    }
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
-            compile(source_code, "<reference_code>", "exec")
-            exec(source_code, namespace, namespace)
-    except Exception as exc:  # noqa: BLE001
-        queue.put(
-            {
-                "reference_code_executable": False,
-                "tests_executable": False,
-                "reference_passes_all_tests": False,
-                "execution_error_message": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        return
-
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
-            for test_case in test_cases:
-                exec(test_case.test_code, namespace, namespace)
-    except Exception as exc:  # noqa: BLE001
-        queue.put(
-            {
-                "reference_code_executable": True,
-                "tests_executable": True,
-                "reference_passes_all_tests": False,
-                "execution_error_message": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        return
-
-    queue.put(
-        {
-            "reference_code_executable": True,
-            "tests_executable": True,
-            "reference_passes_all_tests": True,
-            "execution_error_message": "",
-        }
-    )
-
-
-def _execute_reference_with_tests(
-    problem: ProgrammingProblem,
-    timeout_seconds: float,
-) -> tuple[bool, bool, bool, str]:
-    """Check whether the reference solution executes and passes tests."""
-
-    selected_tests = _select_supported_tests(problem.test_cases)
-    if not selected_tests:
-        return False, False, False, "No executable tests were found."
-
-    context = multiprocessing.get_context("spawn")
-    queue: multiprocessing.Queue = context.Queue()
-    process = context.Process(
-        target=_execution_worker,
-        args=(problem.reference_solution.reference_code, selected_tests, queue),
-    )
-    process.start()
-    process.join(timeout_seconds)
-
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        return False, False, False, "Reference solution execution timed out."
-
-    if queue.empty():
-        return False, False, False, "Reference execution did not return a result."
-
-    payload = queue.get()
-    return (
-        bool(payload["reference_code_executable"]),
-        bool(payload["tests_executable"]),
-        bool(payload["reference_passes_all_tests"]),
-        str(payload.get("execution_error_message", "")),
-    )
-
-
 def _collect_imported_modules(module: ast.Module) -> list[str]:
     imported_modules: list[str] = []
     for node in ast.walk(module):
@@ -263,34 +143,25 @@ def _has_file_io_keywords(module: ast.Module) -> bool:
     return False
 
 
-def _looks_like_accumulator_name(name: str) -> bool:
-    lowered = name.lower()
-    return any(token in lowered for token in ("sum", "total", "count", "acc", "result"))
+def _supported_injector_patterns(module: ast.Module, entry_point: str) -> list[str]:
+    """Injector names that can actually apply to the entry-point function (aligned with injectors/python.py)."""
 
+    target_fn = find_top_level_function(module, entry_point)
+    if target_fn is None:
+        return []
 
-def _supported_injector_patterns(module: ast.Module) -> list[str]:
     supported: set[str] = set()
-    for node in ast.walk(module):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "range":
-            supported.add("off_by_one")
-            if len(node.args) in {2, 3}:
-                supported.add("wrong_loop_bound")
-        if isinstance(node, ast.While) and isinstance(node.test, ast.Compare):
-            supported.add("wrong_loop_bound")
-            supported.add("condition_inversion")
-        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(
-            node.ops[0],
-            (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq),
-        ):
-            supported.add("wrong_comparison_operator")
-        if isinstance(node, ast.If):
-            supported.add("condition_inversion")
-        if isinstance(node, (ast.For, ast.While)) and node.body:
-            supported.add("premature_return")
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            if isinstance(node.value, ast.Constant) and node.value.value in {0, 1}:
-                if _looks_like_accumulator_name(node.targets[0].id):
-                    supported.add("accumulator_init_error")
+    if function_has_off_by_one_site(target_fn) or function_has_wrong_loop_bound_site(target_fn):
+        supported.add("loop_boundary_error")
+    if function_has_accumulator_init_site(target_fn):
+        supported.add("accumulator_init_error")
+    if function_has_condition_inversion_site(target_fn) or function_has_wrong_comparison_operator_site(
+        target_fn
+    ):
+        supported.add("conditional_logic_error")
+    if function_has_premature_return_site(target_fn):
+        supported.add("premature_return")
+
     return sorted(supported)
 
 
@@ -333,12 +204,27 @@ def analyze_sanitized_mbpp_problem(
     imported_modules = _collect_imported_modules(module)
     has_disallowed_imports = any(module_name in _DISALLOWED_IMPORT_MODULES for module_name in imported_modules)
     has_unknown_imports = any(
-        module_name not in _ALLOWED_IMPORT_MODULES and module_name not in _DISALLOWED_IMPORT_MODULES
+        module_name not in ALLOWED_IMPORT_ROOT_MODULES and module_name not in _DISALLOWED_IMPORT_MODULES
         for module_name in imported_modules
     )
-    reference_code_executable, tests_executable, reference_passes_all_tests, execution_error_message = (
-        _execute_reference_with_tests(problem, config.execution_timeout_seconds)
-    )
+    eval_cfg = evaluation_config_for_sanitized_filter(config)
+    if not select_tests_for_evaluation(problem.test_cases, eval_cfg):
+        reference_code_executable = False
+        tests_executable = False
+        reference_passes_all_tests = False
+        execution_error_message = "No executable tests were found."
+    else:
+        ref_result = validate_reference_solution(
+            problem.reference_solution.reference_code,
+            problem.test_cases,
+            eval_cfg,
+        )
+        (
+            reference_code_executable,
+            tests_executable,
+            reference_passes_all_tests,
+            execution_error_message,
+        ) = reference_execution_filter_fields(ref_result)
 
     return SanitizedMbppFilterMetadata(
         line_count=len(problem.reference_solution.reference_code.splitlines()),
@@ -355,7 +241,7 @@ def analyze_sanitized_mbpp_problem(
         has_loops=any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(module)),
         has_comparisons=any(isinstance(node, ast.Compare) for node in ast.walk(module)),
         has_assignments=any(isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) for node in ast.walk(module)),
-        supported_injector_patterns=_supported_injector_patterns(module),
+        supported_injector_patterns=_supported_injector_patterns(module, problem.entry_point),
         reference_code_executable=reference_code_executable,
         tests_executable=tests_executable,
         reference_passes_all_tests=reference_passes_all_tests,

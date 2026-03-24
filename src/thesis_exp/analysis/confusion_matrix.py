@@ -8,6 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from thesis_exp.common.types import canonical_fine_bug_type
+
 LOGGER = logging.getLogger("thesis_exp.analysis.confusion_matrix")
 
 
@@ -24,14 +26,19 @@ def _method_from_record(record: dict[str, Any]) -> str:
 
 
 def _ground_truth_bug_type(record: dict[str, Any]) -> str:
-    return str(record.get("evaluation_result", {}).get("ground_truth_bug_type", "unknown"))
+    raw = record.get("evaluation_result", {}).get("ground_truth_bug_type")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "unknown"
+    merged = canonical_fine_bug_type(str(raw).strip())
+    return merged if merged else "unknown"
 
 
 def _predicted_bug_type(record: dict[str, Any]) -> str | None:
     val = record.get("evaluation_result", {}).get("predicted_bug_type")
     if val is None or (isinstance(val, str) and not val.strip()):
         return None
-    return str(val).strip()
+    merged = canonical_fine_bug_type(str(val).strip())
+    return merged if merged else None
 
 
 def _filter_valid_parsed(records: list[dict[str, Any]]) -> list[dict[str, Any]]:

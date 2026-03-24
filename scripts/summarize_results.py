@@ -35,6 +35,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--output-dir",
         help="Directory for generated analysis artifacts. Optional if --config is provided.",
     )
+    parser.add_argument(
+        "--no-paired-subset",
+        action="store_true",
+        help="Disable paired subset filtering. By default, table_1/table_3 use only samples present in all three conditions.",
+    )
     return parser
 
 
@@ -64,7 +69,11 @@ def main() -> int:
         results_jsonl=args.results_jsonl,
         output_dir=args.output_dir,
     )
-    generate_analysis_artifacts(results_jsonl_path, output_dir)
+    generate_analysis_artifacts(
+        results_jsonl_path,
+        output_dir,
+        use_paired_subset=not args.no_paired_subset,
+    )
     return 0
 
 

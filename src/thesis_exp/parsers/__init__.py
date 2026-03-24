@@ -5,6 +5,7 @@ from thesis_exp.parsers.diagnosis_parser import (
     normalize_bug_type_label,
     normalize_confidence_value,
     parse_model_diagnosis_output,
+    parse_repair_response,
     parse_response_json_payload,
     strict_json_parse,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "normalize_confidence_value",
     "parse_model_diagnosis_output",
     "parse_model_json",
+    "parse_repair_response",
     "parse_response_json_payload",
     "strict_json_parse",
 ]

@@ -21,12 +21,12 @@ def _sample_to_dict(sample: Any) -> dict[str, Any]:
 
 
 def _sample_identifier(sample: Any) -> str:
-    for attribute_name in ("transformed_sample_id", "sample_id", "problem_id"):
+    for attribute_name in ("sample_id", "problem_id"):
         identifier = getattr(sample, attribute_name, None)
         if identifier:
             return str(identifier)
     if isinstance(sample, dict):
-        for key in ("transformed_sample_id", "sample_id", "problem_id"):
+        for key in ("sample_id", "problem_id"):
             identifier = sample.get(key)
             if identifier:
                 return str(identifier)

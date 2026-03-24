@@ -10,6 +10,10 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from typing import Any
 
+# Suppress SyntaxWarning from MBPP reference/test code with invalid escape sequences
+warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
+
+from thesis_exp.execution.safe_exec import build_safe_exec_builtins
 from thesis_exp.schemas.sample import (
     BugInjectionRecord,
     BuggyProgramSample,
@@ -17,36 +21,6 @@ from thesis_exp.schemas.sample import (
     ModelDiagnosisOutput,
     TestCase,
 )
-
-_SAFE_BUILTINS: dict[str, Any] = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "float": float,
-    "int": int,
-    "len": len,
-    "list": list,
-    "max": max,
-    "min": min,
-    "print": print,
-    "range": range,
-    "reversed": reversed,
-    "set": set,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "tuple": tuple,
-    "zip": zip,
-    "AssertionError": AssertionError,
-    "Exception": Exception,
-    "IndexError": IndexError,
-    "KeyError": KeyError,
-    "TypeError": TypeError,
-    "ValueError": ValueError,
-}
 
 _HALLUCINATION_PHRASES = (
     "multiple bugs",
@@ -59,12 +33,14 @@ _HALLUCINATION_PHRASES = (
 )
 
 _KNOWN_BUG_PATTERNS: dict[str, str] = {
-    r"\boff[\s_-]?by[\s_-]?one\b": "off_by_one",
-    r"\bwrong[\s_-]?loop[\s_-]?bound\b": "wrong_loop_bound",
+    r"\boff[\s_-]?by[\s_-]?one\b": "loop_boundary_error",
+    r"\bwrong[\s_-]?loop[\s_-]?bound\b": "loop_boundary_error",
+    r"\bloop[\s_-]?boundary[\s_-]?error\b": "loop_boundary_error",
     r"\baccumulator[\s_-]?(init|initialization)[\s_-]?error\b": "accumulator_init_error",
-    r"\bcondition[\s_-]?inversion\b": "condition_inversion",
+    r"\bcondition[\s_-]?inversion\b": "conditional_logic_error",
+    r"\bconditional[\s_-]?logic[\s_-]?error\b": "conditional_logic_error",
     r"\bpremature[\s_-]?return\b": "premature_return",
-    r"\bwrong[\s_-]?comparison[\s_-]?operator\b": "wrong_comparison_operator",
+    r"\bwrong[\s_-]?comparison[\s_-]?operator\b": "conditional_logic_error",
 }
 
 
@@ -76,6 +52,9 @@ class EvaluationConfig:
     repair_timeout_seconds: float = 2.0
     use_hidden_tests_for_repair: bool = True
     use_public_tests_for_repair: bool = True
+    use_mutation_adequacy: bool = True
+    min_mutants_killed: int = 1
+    max_mutants_for_adequacy: int = 8
 
 
 @dataclass(slots=True)
@@ -106,7 +85,7 @@ class RepairExecutionResult:
 def _repair_worker(source_code: str, test_cases: list[TestCase], queue: multiprocessing.Queue) -> None:
     """Execute patched code and selected tests in a subprocess."""
 
-    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS, "__name__": "__main__"}
+    namespace: dict[str, Any] = {"__builtins__": build_safe_exec_builtins(), "__name__": "__main__"}
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
 
@@ -200,6 +179,15 @@ def _select_repair_tests(test_cases: list[TestCase], config: EvaluationConfig) -
     return selected
 
 
+def select_tests_for_evaluation(test_cases: list[TestCase], config: EvaluationConfig) -> list[TestCase]:
+    """Tests used for reference validation, buggy-sample quality, and repair scoring.
+
+    Public wrapper so filters and scripts share the same selection rules as ``execute_patched_code_safely``.
+    """
+
+    return _select_repair_tests(test_cases, config)
+
+
 def execute_patched_code_safely(
     patched_code: str | None,
     test_cases: list[TestCase],
@@ -269,9 +257,34 @@ def compute_bug_type_accuracy(
     ground_truth: BugInjectionRecord,
     diagnosis: ModelDiagnosisOutput,
 ) -> float:
-    """Return 1.0 when the predicted bug type matches the injected bug type."""
+    """Return 1.0 when the predicted bug type matches the injected bug type (fine-grained)."""
 
-    return float(diagnosis.parsed_bug_type == ground_truth.bug_type)
+    from thesis_exp.common.types import canonical_fine_bug_type
+
+    gt = canonical_fine_bug_type(str(ground_truth.bug_type))
+    pr = canonical_fine_bug_type(diagnosis.parsed_bug_type)
+    if gt is None or pr is None:
+        return 0.0
+    return float(pr == gt)
+
+
+def compute_bug_type_accuracy_coarse(
+    ground_truth: BugInjectionRecord,
+    diagnosis: ModelDiagnosisOutput,
+) -> float:
+    """Return 1.0 when predicted and ground-truth bug types map to the same coarse category.
+
+    Coarse mapping groups structurally similar bugs (e.g. loop_boundary_error → loop_bound_error).
+    For conditional logic, fine and coarse both use ``conditional_logic_error`` (legacy labels are
+    normalized via ``canonical_fine_bug_type``).
+    """
+    from thesis_exp.common.types import to_coarse_bug_type
+
+    gt_coarse = to_coarse_bug_type(ground_truth.bug_type)
+    pred_coarse = to_coarse_bug_type(diagnosis.parsed_bug_type)
+    if gt_coarse is None or pred_coarse is None:
+        return 0.0
+    return float(gt_coarse == pred_coarse)
 
 
 def compute_localization_accuracy(
@@ -290,9 +303,12 @@ def compute_localization_accuracy(
     return float(lower_bound <= predicted_line <= upper_bound)
 
 
-def detect_diagnosis_hallucination(diagnosis: ModelDiagnosisOutput) -> bool:
-    """Detect unsupported extra diagnoses for a single-bug sample."""
+def detect_narrative_hallucination(diagnosis: ModelDiagnosisOutput) -> bool:
+    """Detect narrative hallucination: text claims multiple bugs or unsupported error causes.
 
+    B. Narrative hallucination: extra claims of multiple bugs, or introducing unsupported
+    error explanations. Uses text patterns (e.g. 'multiple bugs', 'another bug').
+    """
     candidate_text = " ".join(
         part for part in (diagnosis.raw_response_text, diagnosis.parsed_bug_explanation) if part
     ).lower()
@@ -309,22 +325,120 @@ def detect_diagnosis_hallucination(diagnosis: ModelDiagnosisOutput) -> bool:
     return any(phrase in candidate_text for phrase in _HALLUCINATION_PHRASES)
 
 
+# Backward-compat alias (old name referred to narrative-style hallucination)
+detect_diagnosis_hallucination = detect_narrative_hallucination
+
+
+def compute_diagnosis_hallucination(
+    ground_truth: BugInjectionRecord,
+    diagnosis: ModelDiagnosisOutput,
+) -> float:
+    """Return 1.0 when predicted bug type does not match ground truth (diagnosis hallucination).
+
+    A. Diagnosis hallucination: the predicted single bug type differs from ground truth.
+    """
+    from thesis_exp.common.types import canonical_fine_bug_type
+
+    if diagnosis.parsed_bug_type is None:
+        return 0.0
+    gt = canonical_fine_bug_type(str(ground_truth.bug_type))
+    pr = canonical_fine_bug_type(diagnosis.parsed_bug_type)
+    if gt is None or pr is None:
+        return 1.0
+    return float(pr != gt)
+
+
+# Values for ``EvaluationResult.mutation_adequacy_status`` (also used in evaluation_notes).
+REPAIR_PATCH_NO_TESTS_SELECTED = "repair_patch_no_tests_selected"
+REPAIR_PATCH_TESTS_FAILED = "repair_patch_tests_failed"
+MUTATION_ADEQUACY_DISABLED = "mutation_adequacy_disabled"
+MUTATION_ADEQUACY_SKIPPED_NO_REFERENCE = "mutation_adequacy_skipped_no_reference"
+MUTATION_ADEQUACY_NOT_ASSESSABLE_NO_MUTANTS = "mutation_adequacy_not_assessable_no_mutants"
+MUTATION_ADEQUACY_FAILED_NO_MUTANTS_KILLED = "mutation_adequacy_failed_no_mutants_killed"
+MUTATION_ADEQUACY_PASSED = "mutation_adequacy_passed"
+MUTATION_ADEQUACY_ERROR_REFERENCE_FAILED_TESTS = "mutation_adequacy_error_reference_failed_tests"
+MUTATION_ADEQUACY_ERROR_EMPTY_REFERENCE = "mutation_adequacy_error_empty_reference"
+
+
 def compute_repair_success(
     diagnosis: ModelDiagnosisOutput,
     test_cases: list[TestCase],
     config: EvaluationConfig,
-) -> tuple[float, RepairExecutionResult]:
-    """Execute patched code and return a binary repair-success score."""
+    reference_code: str | None = None,
+) -> tuple[float, float, RepairExecutionResult, str]:
+    """Execute patched code; return patch-test pass, strict repair success, execution, status.
 
+    Returns ``(patch_passes_selected_tests, repair_success_strict, execution_result, mutation_adequacy_status)``.
+
+    ``patch_passes_selected_tests`` is 1.0 iff the patch passes every selected test (no mutation gate).
+    ``repair_success_strict`` matches the historical ``repair_success`` field (adds mutation adequacy when on).
+
+    When ``use_mutation_adequacy`` is True and ``reference_code`` is set, the strict score requires
+    killing at least ``min_mutants_killed`` mutants **unless** no mutants could be generated
+    (``mutation_adequacy_not_assessable_no_mutants``): in that case the patch is not
+    penalized—mutation coverage is absent, not weak tests.
+    """
     execution_result = execute_patched_code_safely(diagnosis.parsed_repaired_code, test_cases, config)
     if execution_result.total_test_count == 0:
-        return 0.0, execution_result
-    success = (
+        return 0.0, 0.0, execution_result, REPAIR_PATCH_NO_TESTS_SELECTED
+    tests_pass = (
         execution_result.syntax_valid
         and not execution_result.timed_out
         and execution_result.passed_test_count == execution_result.total_test_count
     )
-    return float(success), execution_result
+    patch_passes = 1.0 if tests_pass else 0.0
+    if not tests_pass:
+        return patch_passes, 0.0, execution_result, REPAIR_PATCH_TESTS_FAILED
+
+    if not config.use_mutation_adequacy:
+        return patch_passes, 1.0, execution_result, MUTATION_ADEQUACY_DISABLED
+
+    if not reference_code or not str(reference_code).strip():
+        return patch_passes, 1.0, execution_result, MUTATION_ADEQUACY_SKIPPED_NO_REFERENCE
+
+    from thesis_exp.evaluators.mutation import check_mutation_adequacy
+
+    adequacy = check_mutation_adequacy(
+        reference_code=reference_code,
+        test_cases=test_cases,
+        config=config,
+        max_mutants=config.max_mutants_for_adequacy,
+        min_required_killed=config.min_mutants_killed,
+    )
+
+    if adequacy.empty_reason == "empty_reference_code":
+        return patch_passes, 0.0, execution_result, MUTATION_ADEQUACY_ERROR_EMPTY_REFERENCE
+
+    if adequacy.empty_reason == "reference_failed_tests":
+        return patch_passes, 0.0, execution_result, MUTATION_ADEQUACY_ERROR_REFERENCE_FAILED_TESTS
+
+    if adequacy.total_mutants == 0 and adequacy.empty_reason == "no_mutants_generated":
+        return patch_passes, 1.0, execution_result, MUTATION_ADEQUACY_NOT_ASSESSABLE_NO_MUTANTS
+
+    if not adequacy.adequate:
+        return patch_passes, 0.0, execution_result, MUTATION_ADEQUACY_FAILED_NO_MUTANTS_KILLED
+
+    return patch_passes, 1.0, execution_result, MUTATION_ADEQUACY_PASSED
+
+
+def _format_mutation_adequacy_note(status: str) -> str | None:
+    """Human-readable fragment for ``evaluation_notes``."""
+
+    if status == MUTATION_ADEQUACY_NOT_ASSESSABLE_NO_MUTANTS:
+        return "mutation_adequacy=not_assessable(no_mutants_generated)"
+    if status == MUTATION_ADEQUACY_FAILED_NO_MUTANTS_KILLED:
+        return "tests_adequate=false(mutants_generated_but_none_killed)"
+    if status == MUTATION_ADEQUACY_ERROR_REFERENCE_FAILED_TESTS:
+        return "mutation_adequacy=error(reference_did_not_pass_tests)"
+    if status == MUTATION_ADEQUACY_ERROR_EMPTY_REFERENCE:
+        return "mutation_adequacy=error(empty_reference_code)"
+    if status == MUTATION_ADEQUACY_PASSED:
+        return "mutation_adequacy=passed"
+    if status == MUTATION_ADEQUACY_DISABLED:
+        return None
+    if status == MUTATION_ADEQUACY_SKIPPED_NO_REFERENCE:
+        return "mutation_adequacy=skipped(no_reference_code)"
+    return None
 
 
 def compute_repair_without_true_diagnosis(
@@ -335,26 +449,6 @@ def compute_repair_without_true_diagnosis(
     """Return True when repair succeeds without a faithful diagnosis."""
 
     return bool(repair_success == 1.0 and (bug_type_accuracy < 1.0 or localization_accuracy < 1.0))
-
-
-def compute_consistency_score(results: list[EvaluationResult]) -> float:
-    """Compute agreement across transformed variants using bug type and line only."""
-
-    if not results:
-        return 0.0
-    if len(results) == 1:
-        return 1.0
-
-    signatures = [
-        (
-            result.predicted_bug_type or "<missing>",
-            result.predicted_bug_line_start if result.predicted_bug_line_start is not None else "<missing>",
-        )
-        for result in results
-    ]
-
-    modal_count = max(signatures.count(signature) for signature in signatures)
-    return modal_count / len(signatures)
 
 
 class DiagnosisEvaluator:
@@ -371,6 +465,7 @@ class DiagnosisEvaluator:
         """Evaluate one parsed diagnosis against one buggy sample."""
 
         bug_type_accuracy = compute_bug_type_accuracy(sample.bug_injection_record, diagnosis)
+        bug_type_accuracy_coarse = compute_bug_type_accuracy_coarse(sample.bug_injection_record, diagnosis)
         localization_accuracy = compute_localization_accuracy(
             sample.bug_injection_record,
             diagnosis,
@@ -381,12 +476,16 @@ class DiagnosisEvaluator:
             diagnosis,
             tolerance_lines=0,
         )
-        repair_success, repair_execution_result = compute_repair_success(
-            diagnosis,
-            sample.test_cases,
-            self.config,
+        patch_passes_selected_tests, repair_success, repair_execution_result, mutation_adequacy_status = (
+            compute_repair_success(
+                diagnosis,
+                sample.test_cases,
+                self.config,
+                reference_code=sample.reference_code,
+            )
         )
-        hallucination_detected = detect_diagnosis_hallucination(diagnosis)
+        diagnosis_hallucination = compute_diagnosis_hallucination(sample.bug_injection_record, diagnosis)
+        narrative_hallucination_detected = detect_narrative_hallucination(diagnosis)
         repair_without_true_diagnosis = compute_repair_without_true_diagnosis(
             bug_type_accuracy,
             localization_accuracy_exact,
@@ -394,8 +493,12 @@ class DiagnosisEvaluator:
         )
 
         notes = [
+            f"patch_passes_selected_tests={int(patch_passes_selected_tests)}",
             f"repair_tests_passed={repair_execution_result.passed_test_count}/{repair_execution_result.total_test_count}",
         ]
+        mut_note = _format_mutation_adequacy_note(mutation_adequacy_status)
+        if mut_note is not None:
+            notes.append(mut_note)
         if repair_execution_result.execution_error_message:
             notes.append(repair_execution_result.execution_error_message)
         if diagnosis.parsing_error_message:
@@ -406,7 +509,6 @@ class DiagnosisEvaluator:
         return EvaluationResult(
             evaluation_result_id=f"eval::{diagnosis.diagnosis_output_id}",
             sample_id=diagnosis.sample_id,
-            transformed_sample_id=diagnosis.transformed_sample_id,
             diagnosis_output_id=diagnosis.diagnosis_output_id,
             ground_truth_bug_type=sample.bug_injection_record.bug_type,
             predicted_bug_type=diagnosis.parsed_bug_type,
@@ -415,20 +517,17 @@ class DiagnosisEvaluator:
             predicted_bug_line_start=diagnosis.parsed_bug_line_start,
             predicted_bug_line_end=diagnosis.parsed_bug_line_end,
             bug_type_accuracy=bug_type_accuracy,
+            bug_type_accuracy_coarse=bug_type_accuracy_coarse,
             localization_accuracy=localization_accuracy,
             localization_accuracy_exact=localization_accuracy_exact,
+            patch_passes_selected_tests=patch_passes_selected_tests,
             repair_success=repair_success,
-            hallucination_rate=float(hallucination_detected),
-            consistency_score=0.0,
-            hallucination_detected=hallucination_detected,
+            diagnosis_hallucination_rate=diagnosis_hallucination,
+            narrative_hallucination_rate=float(narrative_hallucination_detected),
+            hallucination_rate=float(narrative_hallucination_detected),
+            narrative_hallucination_detected=narrative_hallucination_detected,
+            hallucination_detected=narrative_hallucination_detected,
             repair_without_true_diagnosis=repair_without_true_diagnosis,
             evaluation_notes=" | ".join(notes),
+            mutation_adequacy_status=mutation_adequacy_status,
         )
-
-    def evaluate_consistency_group(self, results: list[EvaluationResult]) -> float:
-        """Compute and annotate consistency across transformed variants."""
-
-        consistency_score = compute_consistency_score(results)
-        for result in results:
-            result.consistency_score = consistency_score
-        return consistency_score

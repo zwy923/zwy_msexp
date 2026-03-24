@@ -21,22 +21,60 @@ from thesis_exp.evaluators import DiagnosisEvaluator, EvaluationConfig, execute_
 from thesis_exp.injectors.registry import create_injector
 from thesis_exp.llm import DiagnosisArtifactStore, DiagnosisInferenceEngine, ModelConfig
 from thesis_exp.llm.registry import create_adapter
-from thesis_exp.parsers import parse_model_diagnosis_output
+from thesis_exp.parsers import parse_model_diagnosis_output, parse_repair_response
 from thesis_exp.prompts import (
     ExecutionFeedback,
     InputOutputSpecification,
     PromptBuilderOptions,
     PromptContext,
+    RepairPromptContext,
     build_diagnosis_prompt,
+    build_repair_prompt,
 )
-from thesis_exp.quality import SampleQualityConfig, validate_buggy_sample, validate_transformed_sample
-from thesis_exp.schemas.sample import BugInjectionRecord, BuggyProgramSample, EvaluationResult, ModelDiagnosisOutput, ProgrammingProblem, TransformedSample
-from thesis_exp.transforms.registry import create_transformer
+from thesis_exp.quality import SampleQualityConfig, validate_buggy_sample
+from thesis_exp.schemas.sample import BugInjectionRecord, BuggyProgramSample, EvaluationResult, ModelDiagnosisOutput, ProgrammingProblem
 
 try:
     import yaml  # type: ignore
 except ImportError:  # pragma: no cover
     yaml = None
+
+
+def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``override`` into ``base`` (dict keys only; lists replaced)."""
+
+    result: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_yaml_with_extends(path: Path) -> dict[str, Any]:
+    """Load YAML and apply optional ``extends: relative_or_absolute.yaml`` (recursive)."""
+
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load YAML experiment configs.")
+    text = path.read_text(encoding="utf-8")
+    payload = yaml.safe_load(text)
+    if payload is None:
+        raise ValueError(f"Empty or invalid YAML: {path}")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Experiment config must be a mapping: {path}")
+    extends = payload.pop("extends", None)
+    if not extends:
+        return payload
+    base_path = Path(extends)
+    if not base_path.is_absolute():
+        base_path = path.parent / base_path
+    if not base_path.is_file():
+        raise FileNotFoundError(f"extends target not found: {base_path} (from {path})")
+    base_payload = _load_yaml_with_extends(base_path)
+    return _deep_merge_dict(base_payload, payload)
 
 
 @dataclass(slots=True)
@@ -49,23 +87,20 @@ class DatasetConfig:
     run_filtering: bool = False
     filter_output_dir: str = ""
     use_accepted_subset: bool = False
+    sample_ids_path: str | None = None
 
 
 @dataclass(slots=True)
 class GenerationConfig:
-    """Bug generation and transformation configuration."""
+    """Bug injection configuration."""
 
     injector_types: list[str]
-    transformation_names: list[str] = field(default_factory=list)
-    enable_transformations: bool = True
-    include_original_sample: bool = True
     random_seed: int = 0
     max_changed_lines: int = 3
     require_reference_pass_all_tests: bool = True
     require_buggy_fail_some_tests: bool = True
     require_buggy_syntax_valid: bool = True
     require_buggy_executable: bool = True
-    require_transformed_behavior_preserved: bool = True
 
 
 @dataclass(slots=True)
@@ -167,9 +202,7 @@ class RunnerExperimentConfig:
         if suffix == ".json":
             payload = json.loads(path.read_text(encoding="utf-8"))
         elif suffix in {".yaml", ".yml"}:
-            if yaml is None:
-                raise RuntimeError("PyYAML is required to load YAML experiment configs.")
-            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+            payload = _load_yaml_with_extends(path)
         else:
             raise ValueError(f"Unsupported config format: {path.suffix}")
         if not isinstance(payload, dict):
@@ -205,9 +238,21 @@ def load_programming_problems(dataset_config: DatasetConfig) -> list[Programming
     return problems
 
 
+def _load_allowed_sample_ids(sample_ids_path: str | None) -> frozenset[str]:
+    """Load sample_ids from file (one per line). Empty path returns empty set (no restriction)."""
+    if not sample_ids_path:
+        return frozenset()
+    path = Path(sample_ids_path)
+    if not path.exists():
+        return frozenset()
+    ids = {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    return frozenset(ids)
+
+
 def _resolve_dataset_for_runner(
     dataset_config: DatasetConfig,
     output_config: OutputConfig,
+    evaluation_config: EvaluationConfig,
 ) -> DatasetConfig:
     """Resolve dataset input, optionally running sanitized MBPP filtering first."""
 
@@ -218,7 +263,7 @@ def _resolve_dataset_for_runner(
     filter_sanitized_mbpp_samples(
         dataset_config.path,
         filter_output_dir,
-        SanitizedMbppFilterConfig(),
+        SanitizedMbppFilterConfig(evaluation_config=evaluation_config),
     )
 
     if not dataset_config.use_accepted_subset:
@@ -290,34 +335,6 @@ def build_buggy_sample(
     )
 
 
-def generate_transformed_variants(
-    sample: BuggyProgramSample,
-    transformation_names: list[str],
-    quality_config: SampleQualityConfig,
-    logger: logging.Logger | None = None,
-) -> list[TransformedSample]:
-    """Generate transformed variants for one buggy sample."""
-
-    transformed_samples: list[TransformedSample] = []
-    for transformation_name in transformation_names:
-        transformer = create_transformer(transformation_name)
-        transformation_result = transformer.transform(sample, validate_behavior=True)
-        if transformation_result is None:
-            continue
-        transformation_quality_report = validate_transformed_sample(transformation_result, quality_config)
-        if not transformation_quality_report.accepted:
-            if logger is not None:
-                logger.info(
-                    "Rejected transformed sample %s (%s): %s",
-                    transformation_result.transformed_sample.transformed_sample_id,
-                    transformation_name,
-                    "; ".join(transformation_quality_report.failure_reasons),
-                )
-            continue
-        transformed_samples.append(transformation_result.transformed_sample)
-    return transformed_samples
-
-
 def _build_execution_feedback(sample: BuggyProgramSample) -> ExecutionFeedback | None:
     public_test_cases = [test_case for test_case in sample.test_cases if not test_case.is_hidden]
     if not public_test_cases:
@@ -353,32 +370,18 @@ def _build_execution_feedback(sample: BuggyProgramSample) -> ExecutionFeedback |
     )
 
 
-def _build_prompt_context(
-    sample: BuggyProgramSample,
-    transformed_sample: TransformedSample | None,
-) -> PromptContext:
-    buggy_code = transformed_sample.transformed_buggy_code if transformed_sample else sample.buggy_code
-    problem_statement = (
-        transformed_sample.transformed_problem_statement if transformed_sample else sample.problem_statement
-    )
-    starter_code = transformed_sample.transformed_starter_code if transformed_sample else sample.starter_code
-    reference_code = transformed_sample.transformed_reference_code if transformed_sample else sample.reference_code
-    _ = starter_code, reference_code
-
+def _build_prompt_context(sample: BuggyProgramSample) -> PromptContext:
     failing_test_cases = [test_case.test_code for test_case in sample.test_cases if test_case.test_code and not test_case.is_hidden]
     execution_feedback = _build_execution_feedback(sample)
     return PromptContext(
-        sample_id=transformed_sample.transformed_sample_id if transformed_sample else sample.sample_id,
-        problem_statement=problem_statement,
-        buggy_student_code=buggy_code,
+        sample_id=sample.sample_id,
+        problem_statement=sample.problem_statement,
+        buggy_student_code=sample.buggy_code,
         programming_language=sample.programming_language,
         input_output_specification=InputOutputSpecification(),
         failing_test_cases=failing_test_cases,
         execution_feedback=execution_feedback,
-        metadata={
-            "sample_id": sample.sample_id,
-            "transformed_sample_id": transformed_sample.transformed_sample_id if transformed_sample else "",
-        },
+        metadata={"sample_id": sample.sample_id},
     )
 
 
@@ -451,24 +454,15 @@ class IncrementalResultWriter:
                 writer.writerow({column: row.get(column, "") for column in self._csv_header})
 
 
-def _variant_name(transformed_sample: TransformedSample | None) -> str:
-    return transformed_sample.transformation_name if transformed_sample else "original"
-
-
 def _build_record_id(
     config: RunnerExperimentConfig,
     sample: BuggyProgramSample,
-    transformed_sample: TransformedSample | None,
     model_config: ModelRunConfig,
 ) -> str:
-    variant_name = _variant_name(transformed_sample)
-    transformed_id = transformed_sample.transformed_sample_id if transformed_sample else "original"
     return "::".join(
         [
             config.experiment_id,
             sample.sample_id,
-            transformed_id,
-            variant_name,
             model_config.provider_name,
             model_config.model_name,
             config.prompt.variant,
@@ -481,7 +475,6 @@ def _serialize_record(
     record_id: str,
     config: RunnerExperimentConfig,
     sample: BuggyProgramSample,
-    transformed_sample: TransformedSample | None,
     diagnosis_output: Any,
     evaluation_result: EvaluationResult,
 ) -> dict[str, Any]:
@@ -491,17 +484,10 @@ def _serialize_record(
         "experiment_name": config.experiment_name,
         "problem_id": sample.problem_id,
         "sample_id": sample.sample_id,
-        "transformed_sample_id": transformed_sample.transformed_sample_id if transformed_sample else None,
-        "variant_name": _variant_name(transformed_sample),
         "buggy_sample": sample.to_dict(),
-        "transformed_sample": transformed_sample.to_dict() if transformed_sample else None,
         "diagnosis_output": diagnosis_output.to_dict(),
         "evaluation_result": evaluation_result.to_dict(),
     }
-
-
-def _model_group_key(model_run: ModelRunConfig) -> str:
-    return f"{model_run.provider_name}::{model_run.model_name}"
 
 
 class ExperimentRunner:
@@ -538,16 +524,22 @@ class ExperimentRunner:
         """Run the configured experiment end-to-end."""
 
         random.seed(self.config.generation.random_seed)
-        effective_dataset_config = _resolve_dataset_for_runner(self.config.dataset, self.config.output)
+        effective_dataset_config = _resolve_dataset_for_runner(
+            self.config.dataset,
+            self.config.output,
+            self.config.evaluation,
+        )
         problems = load_programming_problems(effective_dataset_config)
         self.logger.info("Loaded %s programming problems.", len(problems))
+        allowed_sample_ids = _load_allowed_sample_ids(effective_dataset_config.sample_ids_path)
+        if allowed_sample_ids:
+            self.logger.info("Restricting to %s sample_ids from %s.", len(allowed_sample_ids), effective_dataset_config.sample_ids_path)
         quality_config = SampleQualityConfig(
             max_changed_lines=self.config.generation.max_changed_lines,
             require_reference_pass_all_tests=self.config.generation.require_reference_pass_all_tests,
             require_buggy_fail_some_tests=self.config.generation.require_buggy_fail_some_tests,
             require_buggy_syntax_valid=self.config.generation.require_buggy_syntax_valid,
             require_buggy_executable=self.config.generation.require_buggy_executable,
-            require_transformed_behavior_preserved=self.config.generation.require_transformed_behavior_preserved,
         )
 
         prompt_options = PromptBuilderOptions(
@@ -581,73 +573,67 @@ class ExperimentRunner:
                     )
                     continue
 
+                if allowed_sample_ids and sample.sample_id not in allowed_sample_ids:
+                    self.logger.debug("Skipping sample %s (not in allowed_sample_ids).", sample.sample_id)
+                    continue
+
                 total_buggy_samples += 1
-                transformed_variants = (
-                    generate_transformed_variants(
-                        sample,
-                        self.config.generation.transformation_names,
-                        quality_config,
-                        logger=self.logger,
-                    )
-                    if self.config.generation.enable_transformations
-                    else []
+                prompt_context = _build_prompt_context(sample)
+                prompt_template = build_diagnosis_prompt(
+                    prompt_context,
+                    self.config.prompt.variant,
+                    options=prompt_options,
                 )
-                sample_variants: list[TransformedSample | None] = []
-                if self.config.generation.include_original_sample:
-                    sample_variants.append(None)
-                sample_variants.extend(transformed_variants)
 
-                pending_group_records: dict[
-                    str,
-                    list[tuple[str, TransformedSample | None, ModelDiagnosisOutput, EvaluationResult]],
-                ] = {}
-                for transformed_sample in sample_variants:
-                    prompt_context = _build_prompt_context(sample, transformed_sample)
-                    prompt_template = build_diagnosis_prompt(
-                        prompt_context,
-                        self.config.prompt.variant,
-                        options=prompt_options,
+                for model_run in self.config.models:
+                    record_id = _build_record_id(self.config, sample, model_run)
+                    model_config = model_run.to_model_config(str(self.artifact_root_dir))
+                    raw_response = self.inference_engine.diagnose(
+                        sample,
+                        prompt_template,
+                        model_config,
+                        run_id=self.config.experiment_id,
+                    )
+                    diagnosis_output = parse_model_diagnosis_output(
+                        raw_response,
+                        diagnosis_output_id=f"diag::{record_id}",
+                        response_schema_name=prompt_template.response_schema_name,
                     )
 
-                    for model_run in self.config.models:
-                        record_id = _build_record_id(self.config, sample, transformed_sample, model_run)
-                        model_config = model_run.to_model_config(str(self.artifact_root_dir))
-                        raw_response = self.inference_engine.diagnose(
-                            transformed_sample or sample,
-                            prompt_template,
+                    if self.config.prompt.variant == "diagnosis_then_repair":
+                        repair_context = RepairPromptContext(
+                            sample_id=prompt_context.sample_id,
+                            problem_statement=prompt_context.problem_statement,
+                            buggy_code=prompt_context.buggy_student_code,
+                            diagnosis_bug_type=diagnosis_output.parsed_bug_type or "unknown",
+                            diagnosis_bug_line=diagnosis_output.parsed_bug_line_start,
+                            diagnosis_explanation=diagnosis_output.parsed_bug_explanation or "",
+                            programming_language=sample.programming_language,
+                        )
+                        repair_prompt = build_repair_prompt(repair_context, options=prompt_options)
+                        repair_response = self.inference_engine.diagnose(
+                            repair_context,
+                            repair_prompt,
                             model_config,
                             run_id=self.config.experiment_id,
                         )
-                        diagnosis_output = parse_model_diagnosis_output(
-                            raw_response,
-                            diagnosis_output_id=f"diag::{record_id}",
-                            transformed_sample_id=transformed_sample.transformed_sample_id if transformed_sample else None,
-                            response_schema_name=prompt_template.response_schema_name,
-                        )
-                        evaluation_result = self.evaluator.evaluate_single(sample, diagnosis_output)
-                        all_results.append(evaluation_result)
-                        pending_group_records.setdefault(_model_group_key(model_run), []).append(
-                            (
-                                record_id,
-                                transformed_sample,
-                                diagnosis_output,
-                                evaluation_result,
-                            )
-                        )
+                        patched_code, repair_error = parse_repair_response(repair_response.response_text)
+                        diagnosis_output.parsed_repaired_code = patched_code
+                        if repair_error:
+                            diagnosis_output.parsing_error_message = (
+                                f"{diagnosis_output.parsing_error_message} | repair: {repair_error}"
+                            ).strip(" |")
 
-                for grouped_records in pending_group_records.values():
-                    grouped_results = [item[3] for item in grouped_records]
-                    self.evaluator.evaluate_consistency_group(grouped_results)
-                    for record_id, transformed_sample, diagnosis_output, evaluation_result in grouped_records:
-                        record = _serialize_record(
-                            record_id=record_id,
-                            config=self.config,
-                            sample=sample,
-                            transformed_sample=transformed_sample,
-                            diagnosis_output=diagnosis_output,
-                            evaluation_result=evaluation_result,
-                        )
-                        self.result_writer.append(record)
+                    evaluation_result = self.evaluator.evaluate_single(sample, diagnosis_output)
+                    all_results.append(evaluation_result)
+                    record = _serialize_record(
+                        record_id=record_id,
+                        config=self.config,
+                        sample=sample,
+                        diagnosis_output=diagnosis_output,
+                        evaluation_result=evaluation_result,
+                    )
+                    self.result_writer.append(record)
 
         self.logger.info(
             "Experiment finished: %s buggy samples, %s records.",

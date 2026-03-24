@@ -10,7 +10,6 @@ from thesis_exp.schemas.sample import (
     ProgrammingProblem,
     ReferenceSolution,
     TestCase,
-    TransformedSample,
 )
 
 __all__ = [
@@ -23,5 +22,4 @@ __all__ = [
     "ProgrammingProblem",
     "ReferenceSolution",
     "TestCase",
-    "TransformedSample",
 ]

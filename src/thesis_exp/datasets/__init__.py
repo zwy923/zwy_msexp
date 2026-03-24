@@ -21,6 +21,7 @@ from thesis_exp.datasets.mbpp_filter import (
     SanitizedMbppFilterMetadata,
     analyze_sanitized_mbpp_problem,
     decide_sanitized_mbpp_problem,
+    evaluation_config_for_sanitized_filter,
     filter_sanitized_mbpp_samples,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     "SanitizedMbppFilterMetadata",
     "analyze_sanitized_mbpp_problem",
     "decide_sanitized_mbpp_problem",
+    "evaluation_config_for_sanitized_filter",
     "filter_sanitized_mbpp_samples",
     "validate_dataset_problem_record",
     "validate_sanitized_mbpp_record",

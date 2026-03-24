@@ -19,25 +19,32 @@ REQUIRED_DIAGNOSIS_FIELDS = (
     "confidence",
 )
 
+DIAGNOSIS_ONLY_FIELDS = ("bug_type", "bug_line", "explanation")
+
 _BUG_TYPE_ALIASES = {
-    "off by one": "off_by_one",
-    "off-by-one": "off_by_one",
-    "off_by_one": "off_by_one",
-    "off_by_one_error": "off_by_one",
-    "loop_bound_error": "wrong_loop_bound",
-    "wrong loop bound": "wrong_loop_bound",
-    "wrong_loop_bound": "wrong_loop_bound",
+    "off by one": "loop_boundary_error",
+    "off-by-one": "loop_boundary_error",
+    "off_by_one": "loop_boundary_error",
+    "offbyone": "loop_boundary_error",
+    "off_by_one_error": "loop_boundary_error",
+    "loop_bound_error": "loop_boundary_error",
+    "loopboundaryerror": "loop_boundary_error",
+    "loop_boundary_error": "loop_boundary_error",
+    "wrong loop bound": "loop_boundary_error",
+    "wrong_loop_bound": "loop_boundary_error",
     "accumulator init error": "accumulator_init_error",
     "accumulator initialization error": "accumulator_init_error",
     "accumulator_init_error": "accumulator_init_error",
-    "condition inversion": "condition_inversion",
-    "condition_inversion": "condition_inversion",
+    "condition inversion": "conditional_logic_error",
+    "condition_inversion": "conditional_logic_error",
     "premature return": "premature_return",
     "premature_return": "premature_return",
-    "wrong comparison operator": "wrong_comparison_operator",
-    "wrong_comparison_operator": "wrong_comparison_operator",
-    "logic_error_inverted_condition": "wrong_comparison_operator",
-    "inverted_condition": "condition_inversion",
+    "wrong comparison operator": "conditional_logic_error",
+    "wrong_comparison_operator": "conditional_logic_error",
+    "logic_error_inverted_condition": "conditional_logic_error",
+    "inverted_condition": "conditional_logic_error",
+    "conditional_logic_error": "conditional_logic_error",
+    "conditional logic error": "conditional_logic_error",
 }
 
 
@@ -241,10 +248,15 @@ def parse_response_json_payload(text: str) -> ParsedJsonPayload:
     )
 
 
-def validate_required_fields(payload: dict[str, Any]) -> list[str]:
+def validate_required_fields(
+    payload: dict[str, Any],
+    *,
+    diagnosis_only: bool = False,
+) -> list[str]:
     """Validate presence of required diagnosis fields."""
 
-    missing_fields = [field_name for field_name in REQUIRED_DIAGNOSIS_FIELDS if field_name not in payload]
+    required = DIAGNOSIS_ONLY_FIELDS if diagnosis_only else REQUIRED_DIAGNOSIS_FIELDS
+    missing_fields = [f for f in required if f not in payload]
     if not missing_fields:
         return []
     return [f"Missing required fields: {', '.join(missing_fields)}."]
@@ -254,8 +266,8 @@ def parse_model_diagnosis_output(
     raw_response: RawLLMResponse,
     *,
     diagnosis_output_id: str,
-    transformed_sample_id: str | None = None,
     response_schema_name: str | None = None,
+    diagnosis_only: bool = False,
 ) -> ModelDiagnosisOutput:
     """Parse one raw model response into a structured diagnosis object."""
 
@@ -274,7 +286,9 @@ def parse_model_diagnosis_output(
     if payload is None:
         error_messages.append("Could not parse any valid diagnosis JSON object from the raw response.")
     else:
-        error_messages.extend(validate_required_fields(payload))
+        schema_name = response_schema_name or ""
+        is_diagnosis_only = diagnosis_only or "diagnosis_only" in schema_name
+        error_messages.extend(validate_required_fields(payload, diagnosis_only=is_diagnosis_only))
 
         if "bug_type" in payload:
             parsed_bug_type, bug_type_error = normalize_bug_type_label(payload.get("bug_type"))
@@ -322,7 +336,6 @@ def parse_model_diagnosis_output(
     return ModelDiagnosisOutput(
         diagnosis_output_id=diagnosis_output_id,
         sample_id=raw_response.sample_id,
-        transformed_sample_id=transformed_sample_id,
         model_provider_name=raw_response.provider_name,
         model_name=raw_response.model_name,
         prompt_template_name=raw_response.prompt_template_name,
@@ -342,3 +355,22 @@ def parse_model_diagnosis_output(
         response_format_valid=response_format_valid,
         parsing_error_message=" ".join(error_messages).strip(),
     )
+
+
+def parse_repair_response(text: str) -> tuple[str | None, str]:
+    """Parse repair-only response. Returns (patched_code, error_message)."""
+
+    result = parse_response_json_payload(text)
+    if result.payload is None:
+        return None, " ".join(result.error_messages).strip() or "Could not parse repair JSON."
+
+    payload = result.payload
+    if "patched_code" not in payload:
+        return None, "Missing patched_code field in repair response."
+
+    val = payload["patched_code"]
+    if isinstance(val, str) and val.strip():
+        return val.strip(), ""
+    if val is None:
+        return None, "patched_code is null."
+    return None, f"patched_code must be a non-empty string, got {type(val).__name__}."

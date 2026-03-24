@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress SyntaxWarning from MBPP reference/test code with invalid escape sequences (e.g. "\w", "\.")
+warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
 
 def _bootstrap_src_path() -> None:

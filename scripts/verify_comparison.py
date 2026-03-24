@@ -123,6 +123,8 @@ def main() -> int:
             "sample_id": sid,
             "record_id_direct": rd.get("record_id"),
             "record_id_ef_leaky": rl.get("record_id"),
+            "patch_passes_selected_tests_direct": ev_d.get("patch_passes_selected_tests"),
+            "patch_passes_selected_tests_ef_leaky": ev_l.get("patch_passes_selected_tests"),
             "repair_success_direct": ev_d.get("repair_success"),
             "repair_success_ef_leaky": ev_l.get("repair_success"),
             "bug_type_accuracy_direct": ev_d.get("bug_type_accuracy"),
@@ -134,6 +136,7 @@ def main() -> int:
             rn = ef_no_answer_by_sample[sid]
             ev_n = rn.get("evaluation_result", {})
             row["record_id_ef_no_answer"] = rn.get("record_id")
+            row["patch_passes_selected_tests_ef_no_answer"] = ev_n.get("patch_passes_selected_tests")
             row["repair_success_ef_no_answer"] = ev_n.get("repair_success")
             row["bug_type_accuracy_ef_no_answer"] = ev_n.get("bug_type_accuracy")
             row["loc_acc_ef_no_answer"] = ev_n.get("localization_accuracy")
@@ -284,7 +287,29 @@ def main() -> int:
                 wrong_loc_only.append(sample_key(r))
             elif bt < 1.0 and loc is not None and loc < 1.0:
                 both_wrong.append(sample_key(r))
+        def _patch_ok(ev: dict) -> bool:
+            v = ev.get("patch_passes_selected_tests")
+            if v is not None:
+                try:
+                    return float(v) >= 1.0
+                except (TypeError, ValueError):
+                    return False
+            notes = str(ev.get("evaluation_notes", "") or "")
+            if "repair_tests_passed=" in notes:
+                frag = notes.split("repair_tests_passed=")[1].split("|")[0].strip()
+                if "/" in frag:
+                    a, b = frag.split("/", 1)
+                    try:
+                        ai, bi = int(a.strip()), int(b.strip())
+                        return bi > 0 and ai == bi
+                    except ValueError:
+                        pass
+            return False
+
         return {
+            "patch_passes_selected_tests_count": sum(
+                1 for r in records if _patch_ok(r.get("evaluation_result", {}))
+            ),
             "repair_success_count": sum(1 for r in records if r.get("evaluation_result", {}).get("repair_success") == 1.0),
             "repair_without_true_diagnosis_count": sum(1 for r in records if r.get("evaluation_result", {}).get("repair_without_true_diagnosis")),
             "wrong_bug_type_only": wrong_bug_only,

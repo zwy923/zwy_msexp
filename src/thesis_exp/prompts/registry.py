@@ -23,4 +23,6 @@ def list_prompt_variants() -> list[str]:
         "diagnosis_with_execution_feedback",
         "diagnosis_with_execution_feedback_no_leakage",
         "diagnosis_with_self_check",
+        "diagnosis_only",
+        "diagnosis_then_repair",
     ]

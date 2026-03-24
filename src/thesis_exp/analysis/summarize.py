@@ -13,6 +13,7 @@ from statistics import mean
 from typing import Any
 
 from thesis_exp.analysis.confusion_matrix import generate_confusion_matrix_artifacts
+from thesis_exp.common.types import canonical_fine_bug_type
 from thesis_exp.schemas.sample import EvaluationResult
 
 
@@ -20,17 +21,22 @@ LOGGER = logging.getLogger("thesis_exp.analysis.summarize")
 
 MAIN_RESULT_METRICS = (
     "bug_type_accuracy",
+    "bug_type_accuracy_coarse",
     "localization_accuracy",
     "localization_accuracy_exact",
+    "patch_passes_selected_tests",
     "repair_success",
+    "diagnosis_hallucination_rate",
+    "narrative_hallucination_rate",
     "hallucination_rate",
-    "consistency_score",
 )
 
 BUG_TYPE_BREAKDOWN_METRICS = (
     "bug_type_accuracy",
+    "bug_type_accuracy_coarse",
     "localization_accuracy",
     "localization_accuracy_exact",
+    "patch_passes_selected_tests",
     "repair_success",
 )
 
@@ -43,12 +49,13 @@ class AnalysisArtifacts:
     bug_type_table_csv: str
     execution_feedback_table_csv: str
     hallucination_rate_figure_svg: str
-    repair_vs_bug_type_figure_svg: str
+    two_layer_repair_figure_svg: str
+    repair_success_vs_bug_type_figure_svg: str
     summary_json: str
 
 
 def summarize_results(results: Iterable[EvaluationResult]) -> dict[str, float]:
-    """Compute dataset-level means for the five core metrics."""
+    """Compute dataset-level means for core metrics (incl. two-layer repair)."""
 
     materialized_results = list(results)
     if not materialized_results:
@@ -103,7 +110,11 @@ def _model_label(record: dict[str, Any]) -> str:
 
 def _ground_truth_bug_type(record: dict[str, Any]) -> str:
     evaluation_result = record.get("evaluation_result", {})
-    return str(evaluation_result.get("ground_truth_bug_type", "unknown_bug_type"))
+    raw = evaluation_result.get("ground_truth_bug_type")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "unknown_bug_type"
+    merged = canonical_fine_bug_type(str(raw).strip())
+    return merged if merged else "unknown_bug_type"
 
 
 def _uses_execution_feedback(record: dict[str, Any]) -> bool:
@@ -112,7 +123,7 @@ def _uses_execution_feedback(record: dict[str, Any]) -> bool:
 
 
 def _ef_condition(record: dict[str, Any]) -> str:
-    """Return condition label for three-way comparison: direct | ef_leaky | ef_no_answer."""
+    """Return condition label for three-way comparison: direct | ef_leaky | ef_no_answer | diagnosis_only | diagnosis_then_repair."""
     name = _method_name(record)
     if name == "direct_diagnosis":
         return "direct"
@@ -120,7 +131,107 @@ def _ef_condition(record: dict[str, Any]) -> str:
         return "ef_leaky"
     if name == "diagnosis_with_execution_feedback_no_leakage":
         return "ef_no_answer"
+    if name == "diagnosis_only":
+        return "diagnosis_only"
+    if name == "diagnosis_then_repair":
+        return "diagnosis_then_repair"
     return "other"
+
+
+def _paired_key(record: dict[str, Any]) -> tuple[str, str]:
+    """Canonical key for joining: (sample_id, variant id or 'original').
+
+    New result records omit ``transformed_sample_id``; missing key is treated as ``original``.
+    """
+    sample_id = str(record.get("sample_id", ""))
+    tid = record.get("transformed_sample_id")
+    transformed_id = str(tid) if tid else "original"
+    return (sample_id, transformed_id)
+
+
+def filter_to_paired_subset(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Keep only records where the same (sample_id, transformed_sample_id) exists in all three conditions.
+    Returns (filtered_records, alignment_info).
+    """
+    by_condition: dict[str, list[dict[str, Any]]] = {
+        "direct": [],
+        "ef_leaky": [],
+        "ef_no_answer": [],
+    }
+    for r in records:
+        cond = _ef_condition(r)
+        if cond in by_condition:
+            by_condition[cond].append(r)
+
+    keys_direct = {_paired_key(r) for r in by_condition["direct"]}
+    keys_ef_leaky = {_paired_key(r) for r in by_condition["ef_leaky"]}
+    keys_ef_no_answer = {_paired_key(r) for r in by_condition["ef_no_answer"]}
+
+    # Paired = present in all three
+    paired_keys = keys_direct & keys_ef_leaky & keys_ef_no_answer
+
+    # If any condition is empty, no paired subset; return all records
+    if not paired_keys or not by_condition["direct"] or not by_condition["ef_leaky"] or not by_condition["ef_no_answer"]:
+        alignment_info = {
+            "use_paired_subset": False,
+            "n_paired": 0,
+            "n_direct": len(by_condition["direct"]),
+            "n_ef_leaky": len(by_condition["ef_leaky"]),
+            "n_ef_no_answer": len(by_condition["ef_no_answer"]),
+            "reason": "Paired subset empty or not all three conditions present.",
+        }
+        return records, alignment_info
+
+    # Keep one record per (paired_key, condition) to avoid double-counting duplicates
+    seen: set[tuple[tuple[str, str], str]] = set()
+    filtered: list[dict[str, Any]] = []
+    for r in records:
+        key = _paired_key(r)
+        if key not in paired_keys:
+            continue
+        cond = _ef_condition(r)
+        if (key, cond) in seen:
+            continue
+        seen.add((key, cond))
+        filtered.append(r)
+    alignment_info = {
+        "use_paired_subset": True,
+        "n_paired": len(paired_keys),
+        "n_direct": len(by_condition["direct"]),
+        "n_ef_leaky": len(by_condition["ef_leaky"]),
+        "n_ef_no_answer": len(by_condition["ef_no_answer"]),
+        "n_direct_only": len(keys_direct - keys_ef_leaky - keys_ef_no_answer),
+        "n_ef_leaky_only": len(keys_ef_leaky - keys_direct - keys_ef_no_answer),
+        "n_ef_no_answer_only": len(keys_ef_no_answer - keys_direct - keys_ef_leaky),
+    }
+    return filtered, alignment_info
+
+
+def _infer_patch_passes_from_notes(evaluation_result: dict[str, Any]) -> float | None:
+    """Best-effort for JSONL written before ``patch_passes_selected_tests`` existed."""
+
+    if evaluation_result.get("patch_passes_selected_tests") is not None:
+        return None
+    notes = str(evaluation_result.get("evaluation_notes", "") or "")
+    if "patch_passes_selected_tests=" in notes:
+        frag = notes.split("patch_passes_selected_tests=")[1].split("|")[0].strip()
+        try:
+            return 1.0 if int(frag) == 1 else 0.0
+        except ValueError:
+            return None
+    if "repair_tests_passed=" in notes:
+        frag = notes.split("repair_tests_passed=")[1].split("|")[0].strip()
+        if "/" in frag:
+            a, b = frag.split("/", 1)
+            try:
+                ai, bi = int(a.strip()), int(b.strip())
+                if bi == 0:
+                    return 0.0
+                return 1.0 if ai == bi else 0.0
+            except ValueError:
+                return None
+    return None
 
 
 def _metric_value(record: dict[str, Any], metric_name: str) -> float:
@@ -128,6 +239,10 @@ def _metric_value(record: dict[str, Any], metric_name: str) -> float:
     value = evaluation_result.get(metric_name)
     if value is None and metric_name == "localization_accuracy_exact":
         value = evaluation_result.get("localization_accuracy")
+    if value is None and metric_name == "patch_passes_selected_tests":
+        inferred = _infer_patch_passes_from_notes(evaluation_result)
+        if inferred is not None:
+            return inferred
     return _safe_float(value)
 
 
@@ -368,37 +483,82 @@ def build_execution_feedback_comparison_table(records: list[dict[str, Any]]) -> 
 def generate_analysis_artifacts(
     results_jsonl_path: str | list[str],
     output_dir: str,
+    *,
+    use_paired_subset: bool = True,
 ) -> AnalysisArtifacts:
-    """Generate tables and figures from runner JSONL outputs."""
+    """Generate tables and figures from runner JSONL outputs.
+
+    When use_paired_subset=True (default), table_1, table_3, and confusion matrices
+    use only the paired subset: samples present in all three conditions (direct,
+    ef_leaky, ef_no_answer). This ensures n_records is identical across conditions
+    for a fair comparison.
+    """
 
     records = load_result_records(results_jsonl_path)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    main_table_rows = build_main_result_table(records)
-    bug_type_rows = build_bug_type_breakdown_table(records)
-    feedback_rows = build_execution_feedback_comparison_table(records)
+    records_for_tables = records
+    alignment_info: dict[str, Any] = {}
+    if use_paired_subset:
+        records_for_tables, alignment_info = filter_to_paired_subset(records)
+        if alignment_info.get("use_paired_subset"):
+            LOGGER.info(
+                "Using paired subset: n_paired=%s (direct=%s, ef_leaky=%s, ef_no_answer=%s)",
+                alignment_info["n_paired"],
+                alignment_info["n_direct"],
+                alignment_info["n_ef_leaky"],
+                alignment_info["n_ef_no_answer"],
+            )
+        else:
+            LOGGER.info("Paired subset not applicable: %s", alignment_info.get("reason", ""))
+
+    main_table_rows = build_main_result_table(records_for_tables)
+    bug_type_rows = build_bug_type_breakdown_table(records_for_tables)
+    feedback_rows = build_execution_feedback_comparison_table(records_for_tables)
 
     main_table_csv = output_path / "table_1_main_results.csv"
     bug_type_table_csv = output_path / "table_2_bug_type_breakdown.csv"
     feedback_table_csv = output_path / "table_3_execution_feedback_comparison.csv"
     hallucination_svg = output_path / "figure_1_hallucination_rate.svg"
-    repair_vs_bug_type_svg = output_path / "figure_2_repair_vs_bug_type_accuracy.svg"
+    two_layer_repair_svg = output_path / "figure_2_two_layer_repair.svg"
+    repair_vs_bug_type_svg = output_path / "figure_3_repair_success_vs_bug_type_accuracy.svg"
     summary_json = output_path / "analysis_summary.json"
 
     _write_csv(main_table_rows, main_table_csv)
     _write_csv(bug_type_rows, bug_type_table_csv)
     _write_csv(feedback_rows, feedback_table_csv)
 
-    hallucination_values = [
-        (f"{row['method']} | {row['model_name']}", float(row["hallucination_rate"]))
+    hallucination_grouped_values = [
+        (
+            f"{row['method']} | {row['model_name']}",
+            float(row.get("diagnosis_hallucination_rate", 0.0)),
+            float(row.get("narrative_hallucination_rate", row.get("hallucination_rate", 0.0))),
+        )
         for row in main_table_rows
     ]
-    _create_bar_chart_svg(
-        hallucination_values,
-        title="Hallucination Rate by Method and Model",
-        y_axis_label="Hallucination Rate",
+    _create_grouped_bar_chart_svg(
+        hallucination_grouped_values,
+        title="Diagnosis vs Narrative Hallucination by Method and Model",
+        left_metric_name="diagnosis_hallucination_rate",
+        right_metric_name="narrative_hallucination_rate",
         output_path=hallucination_svg,
+    )
+
+    two_layer_values = [
+        (
+            f"{row['method']} | {row['model_name']}",
+            float(row["patch_passes_selected_tests"]),
+            float(row["repair_success"]),
+        )
+        for row in main_table_rows
+    ]
+    _create_grouped_bar_chart_svg(
+        two_layer_values,
+        title="Two-layer repair: patch passes selected tests vs strict success (mutation adequacy)",
+        left_metric_name="patch_passes_selected_tests",
+        right_metric_name="repair_success",
+        output_path=two_layer_repair_svg,
     )
 
     grouped_bar_values = [
@@ -411,15 +571,17 @@ def generate_analysis_artifacts(
     ]
     _create_grouped_bar_chart_svg(
         grouped_bar_values,
-        title="Repair Success vs Bug Type Accuracy",
+        title="Strict repair success vs bug type accuracy",
         left_metric_name="repair_success",
         right_metric_name="bug_type_accuracy",
         output_path=repair_vs_bug_type_svg,
     )
 
     summary_payload = {
-        "n_records": len(records),
-        "repair_without_true_diagnosis_rate_overall": _derived_rate(records, "repair_without_true_diagnosis"),
+        "n_records": len(records_for_tables),
+        "n_records_full": len(records),
+        "paired_subset_alignment": alignment_info,
+        "repair_without_true_diagnosis_rate_overall": _derived_rate(records_for_tables, "repair_without_true_diagnosis"),
         "main_result_table_rows": main_table_rows,
         "bug_type_breakdown_rows": bug_type_rows,
         "execution_feedback_rows": feedback_rows,
@@ -432,7 +594,7 @@ def generate_analysis_artifacts(
                     _derived_rate(
                         [
                             record
-                            for record in records
+                            for record in records_for_tables
                             if _method_name(record) == row["method"]
                             and _model_provider_name(record) == row["model_provider"]
                             and _model_name(record) == row["model_name"]
@@ -447,7 +609,7 @@ def generate_analysis_artifacts(
     }
     summary_json.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
-    confusion_paths = generate_confusion_matrix_artifacts(records, output_path)
+    confusion_paths = generate_confusion_matrix_artifacts(records_for_tables, output_path)
     for p in confusion_paths:
         LOGGER.info("Generated confusion matrix artifact: %s", p)
 
@@ -457,7 +619,8 @@ def generate_analysis_artifacts(
         bug_type_table_csv=str(bug_type_table_csv),
         execution_feedback_table_csv=str(feedback_table_csv),
         hallucination_rate_figure_svg=str(hallucination_svg),
-        repair_vs_bug_type_figure_svg=str(repair_vs_bug_type_svg),
+        two_layer_repair_figure_svg=str(two_layer_repair_svg),
+        repair_success_vs_bug_type_figure_svg=str(repair_vs_bug_type_svg),
         summary_json=str(summary_json),
     )
 

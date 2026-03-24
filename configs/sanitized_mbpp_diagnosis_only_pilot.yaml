@@ -1,0 +1,8 @@
+extends: sanitized_mbpp.common.yaml
+experiment_id: sanitized_mbpp_diagnosis_only_pilot
+experiment_name: Sanitized MBPP diagnosis-only pilot (no patch)
+prompt:
+  variant: diagnosis_only
+output:
+  results_dir: results/sanitized_mbpp_diagnosis_only_pilot
+  artifact_root_dir: results/sanitized_mbpp_diagnosis_only_pilot/artifacts

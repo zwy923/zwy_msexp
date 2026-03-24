@@ -81,6 +81,130 @@ def _looks_like_accumulator(name: str) -> bool:
     return any(token in name.lower() for token in ("sum", "total", "count", "acc", "result"))
 
 
+def find_top_level_function(
+    module: ast.Module,
+    function_name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """Return the first top-level function/async def with the given name (same resolution as injectors)."""
+
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+            return node
+    return None
+
+
+def function_has_premature_return_site(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """True iff PrematureReturnInjector can find a non-return loop statement with a resolvable return_name.
+
+    Mirrors PrematureReturnInjector._build_edit so dataset filtering matches injector applicability.
+    """
+
+    accumulator_name: str | None = None
+    for statement in function_node.body:
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            candidate = _accumulator_name_from_assign(statement)
+            if candidate and _looks_like_accumulator(candidate):
+                accumulator_name = candidate
+                break
+
+    for node in ast.walk(function_node):
+        if not isinstance(node, (ast.For, ast.While)) or not node.body:
+            continue
+
+        for statement in node.body:
+            if isinstance(statement, ast.Return):
+                continue
+
+            if isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
+                return_name = statement.target.id
+            elif isinstance(statement, ast.Assign):
+                return_name = _accumulator_name_from_assign(statement) or accumulator_name
+            else:
+                return_name = accumulator_name
+
+            if return_name is None:
+                continue
+
+            return True
+
+    return False
+
+
+# Operator types WrongComparisonOperatorInjector can rewrite (must match _operator_map keys).
+_WRONG_COMPARISON_OPERATOR_TYPES: frozenset[type] = frozenset(
+    (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq),
+)
+
+
+def function_has_off_by_one_site(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True iff OffByOneInjector can rewrite a range() stop argument."""
+
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id != "range":
+            continue
+        if len(node.args) not in (1, 2, 3):
+            continue
+        return True
+    return False
+
+
+def function_has_wrong_loop_bound_site(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True iff WrongLoopBoundInjector can edit a range stop (2/3-arg) or a while Compare bound."""
+
+    for node in ast.walk(function_node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "range":
+            if len(node.args) in (2, 3):
+                return True
+        if isinstance(node, ast.While) and isinstance(node.test, ast.Compare) and len(node.test.ops) == 1:
+            return True
+    return False
+
+
+def function_has_accumulator_init_site(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True iff AccumulatorInitErrorInjector can flip a 0/1 init (top-level body only, same as injector)."""
+
+    for node in function_node.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            name = _accumulator_name_from_assign(node)
+            if name is None or not _looks_like_accumulator(name):
+                continue
+            if node.value.value in (0, 1):
+                return True
+        if isinstance(node, ast.AnnAssign) and isinstance(node.value, ast.Constant):
+            name = _accumulator_name_from_assign(node)
+            if name is None or not _looks_like_accumulator(name):
+                continue
+            if node.value.value in (0, 1):
+                return True
+    return False
+
+
+def function_has_condition_inversion_site(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True iff ConditionInversionInjector finds an If or While (first target in walk order)."""
+
+    for node in ast.walk(function_node):
+        if isinstance(node, (ast.If, ast.While)):
+            return True
+    return False
+
+
+def function_has_wrong_comparison_operator_site(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """True iff WrongComparisonOperatorInjector finds a single-op Compare with a swappable operator."""
+
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+            continue
+        if type(node.ops[0]) in _WRONG_COMPARISON_OPERATOR_TYPES:
+            return True
+    return False
+
+
 class _PythonAstInjector(BaseBugInjector):
     """Shared AST-based injector logic."""
 
@@ -121,9 +245,9 @@ class _PythonAstInjector(BaseBugInjector):
 
 
 class OffByOneInjector(_PythonAstInjector):
-    """Inject an off-by-one bug in a loop range."""
+    """Inject a loop-boundary bug in a ``range`` stop (expand stop by one)."""
 
-    bug_type: BugType = "off_by_one"
+    bug_type: BugType = "loop_boundary_error"
 
     def _build_edit(
         self,
@@ -156,9 +280,9 @@ class OffByOneInjector(_PythonAstInjector):
 
 
 class WrongLoopBoundInjector(_PythonAstInjector):
-    """Inject a wrong loop bound bug."""
+    """Inject a loop-boundary bug (shrink ``range`` stop or ``while`` bound by one)."""
 
-    bug_type: BugType = "wrong_loop_bound"
+    bug_type: BugType = "loop_boundary_error"
 
     def _build_edit(
         self,
@@ -251,7 +375,7 @@ class AccumulatorInitErrorInjector(_PythonAstInjector):
 class ConditionInversionInjector(_PythonAstInjector):
     """Inject a condition inversion bug."""
 
-    bug_type: BugType = "condition_inversion"
+    bug_type: BugType = "conditional_logic_error"
 
     def _build_edit(
         self,
@@ -332,7 +456,7 @@ class PrematureReturnInjector(_PythonAstInjector):
 class WrongComparisonOperatorInjector(_PythonAstInjector):
     """Inject a wrong comparison operator bug."""
 
-    bug_type: BugType = "wrong_comparison_operator"
+    bug_type: BugType = "conditional_logic_error"
 
     _operator_map: dict[type[ast.cmpop], ast.cmpop] = {
         ast.Lt: ast.LtE(),

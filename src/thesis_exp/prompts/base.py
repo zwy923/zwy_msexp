@@ -13,6 +13,8 @@ PromptVariant = Literal[
     "diagnosis_with_execution_feedback",  # EF-leaky: includes full assertions (expected outputs) + full traceback
     "diagnosis_with_execution_feedback_no_leakage",  # EF-no-answer: no expected output, only failure count + exception types
     "diagnosis_with_self_check",
+    "diagnosis_only",  # No patch: bug_type, bug_line, explanation only (tests task entanglement)
+    "diagnosis_then_repair",  # Two-stage: first diagnosis_only, then repair-only prompt
 ]
 
 

@@ -1,0 +1,60 @@
+# Shared MBPP pilot settings. Do not run alone — use a `*_pilot.yaml` that sets `extends: sanitized_mbpp.common.yaml`.
+dataset:
+  path: sanitized-mbpp.json
+  format: sanitized_mbpp
+  max_problems: 100
+  run_filtering: true
+  filter_output_dir: data/filtered/sanitized_mbpp_direct_pilot
+  use_accepted_subset: true
+  sample_ids_path: data/paired_sample_ids.txt
+
+generation:
+  injector_types:
+    - off_by_one
+    - wrong_loop_bound
+    - accumulator_init_error
+    - condition_inversion
+    - premature_return
+    - wrong_comparison_operator
+  random_seed: 123
+  max_changed_lines: 3
+  require_reference_pass_all_tests: true
+  require_buggy_fail_some_tests: true
+  require_buggy_syntax_valid: true
+  require_buggy_executable: true
+
+prompt:
+  include_language_tag: true
+  include_output_schema_example: true
+  require_json_only_response: true
+
+models:
+  - provider_name: openai_compatible
+    model_name: gpt-5-mini
+    api_base_url: https://api.openai.com/v1
+    api_key_env_var: OPENAI_API_KEY
+    enable_json_output: true
+    temperature: 0.0
+    max_output_tokens: 4096
+    timeout_seconds: 60.0
+    max_retries: 3
+    backoff_initial_seconds: 1.0
+    backoff_multiplier: 2.0
+    extra_settings: {}
+
+evaluation:
+  # ±k lines around the injected span: models often cite the effect (next line) vs the
+  # edited condition line; tolerance 1 treats that as correct localization.
+  localization_tolerance_lines: 1
+  # Spawn + exec + several asserts: too low a timeout yields false timeouts on cold runs.
+  repair_timeout_seconds: 10.0
+  use_hidden_tests_for_repair: true
+  use_public_tests_for_repair: true
+  use_mutation_adequacy: true
+  min_mutants_killed: 1
+  max_mutants_for_adequacy: 8
+
+output:
+  jsonl_filename: results.jsonl
+  csv_filename: results.csv
+  log_level: INFO
